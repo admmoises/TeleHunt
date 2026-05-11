@@ -3,11 +3,11 @@ import datetime
 import json
 import os
 import re
+import sqlite3
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 from telethon.tl.types import User, MessageMediaPhoto, MessageMediaPoll, MessageMediaStory, MessageMediaDocument
 from tabulate import tabulate
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 from argparse import ArgumentParser
 
@@ -44,6 +44,11 @@ def save_accounts(data):
 def save_data(file, data):
     with open(file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
+
+
+async def stream_save_list(file, stream_data, lock):
+    async with lock:
+        save_data(file, stream_data)
 
 def clear():
     os.system("cls || clear")
@@ -106,6 +111,46 @@ def get_message_type(message):
                         return "File"
     return "Text"
 
+async def resolve_prompt_value(provider, prompt_text):
+    if provider is None:
+        return None
+    try:
+        result = provider(prompt_text)
+    except TypeError:
+        result = provider()
+
+    if asyncio.iscoroutine(result):
+        result = await result
+    return result
+
+
+async def connect_with_retry(client, session_label="unknown", retries=5, base_delay=1.0):
+    for attempt in range(1, retries + 1):
+        try:
+            await client.connect()
+            # Avoid session entity writes when the sqlite session is contested.
+            if hasattr(client, "session") and client.session:
+                client.session.save_entities = False
+            return True
+        except (sqlite3.OperationalError, Exception) as e:
+            if "database is locked" not in str(e).lower():
+                raise
+
+            if attempt < retries:
+                wait_seconds = base_delay * attempt
+                print(
+                    f"{messages['war']}Session locked for {session_label}. "
+                    f"Retrying in {wait_seconds:.1f}s ({attempt}/{retries})..."
+                )
+                await asyncio.sleep(wait_seconds)
+                continue
+
+            print(
+                f"{messages['error']}Session database is locked for {session_label}. "
+                "Close other processes using this account and try again."
+            )
+            return False
+
 async def get_chat_id_by_username(client, username):
     try: 
         entity = await client.get_entity(username)
@@ -152,22 +197,38 @@ async def get_user_by_id(client, user_id):
         print(f"{messages['war']}Error fetching user by ID {user_id}: {e}")
         return 3
     
-async def add_account(api_hash, api_id, phone):
+async def add_account(api_hash, api_id, phone, code_provider=None, password_provider=None):
     session_name = f"session_{phone.replace('+','')}"
     print(f"{messages['suc']}Creating session: {session_name}.session")
 
     client = TelegramClient(session_name, api_id=int(api_id), api_hash=api_hash)
-    await client.connect()  
+    if not await connect_with_retry(client, phone):
+        return
 
     if not await client.is_user_authorized():  
         print(f"{messages['suc']}Code sent to {phone}")
         sent_code = await client.send_code_request(phone) 
-        code = input(f"{messages['suc']}Enter the code: ")
+        if code_provider is None:
+            code = input(f"{messages['suc']}Enter the code: ")
+        else:
+            code = await resolve_prompt_value(code_provider, f"{messages['suc']}Enter the code: ")
+
+        if not code:
+            print(f"{messages['error']}No login code was provided.")
+            await client.disconnect()
+            return
 
         try:
             await client.sign_in(phone, phone_code_hash=sent_code.phone_code_hash, code=code) 
         except SessionPasswordNeededError:
-            password = input(f"{messages['war']}Two-step password required: ")
+            if password_provider is None:
+                password = input(f"{messages['war']}Two-step password required: ")
+            else:
+                password = await resolve_prompt_value(password_provider, f"{messages['war']}Two-step password required: ")
+            if not password:
+                print(f"{messages['error']}No two-step password was provided.")
+                await client.disconnect()
+                return
             await client.sign_in(password=password) 
 
     me = await client.get_me()  
@@ -198,11 +259,12 @@ async def add_account(api_hash, api_id, phone):
 
     await client.disconnect()  
 
-async def search_messages_for_account(account, search_text=3, sender=3, limit=3, forward_to=3, file_type=3):
+async def search_messages_for_account(account, search_text=3, sender=3, limit=3, forward_to=3, file_type=3, stream_data=None, stream_lock=None):
     try:
         session_name = account['session_file'].split('.')[0]
         client = TelegramClient(session_name, account['api_id'], account['api_hash'])
-        await client.connect()
+        if not await connect_with_retry(client, account['phone']):
+            return []
 
         print(f"{messages['wait']}Searching messages for account: {account['phone']}")
 
@@ -241,7 +303,7 @@ async def search_messages_for_account(account, search_text=3, sender=3, limit=3,
                         else:
                             sender_name = "Unknown"
 
-                        messages_found.append({
+                        found_message = {
                             "dialog_id": dialog.id,
                             "message_id": message.id,
                             "sender_id": message.sender_id,
@@ -249,7 +311,12 @@ async def search_messages_for_account(account, search_text=3, sender=3, limit=3,
                             "message_type": message_type,
                             "message": cleaned_msg_text[:150],
                             "date": message.date.isoformat()
-                        })
+                        }
+                        messages_found.append(found_message)
+
+                        if stream_data is not None and stream_lock is not None:
+                            stream_data.append(found_message)
+                            await stream_save_list(FILES["messages"], stream_data, stream_lock)
 
                         find_counter += 1
                         if limit and find_counter >= limit:
@@ -330,10 +397,24 @@ async def search_messages(account_numbers, search_text=3, sender=3, limit=3, for
         return
 
     account_messages = {}
+    stream_messages = []
+    stream_lock = asyncio.Lock()
+    save_data(FILES["messages"], stream_messages)
 
     tasks = []
     for account in selected_accounts:
-        tasks.append(search_messages_for_account(account, search_text, sender, limit, forward_to, file_type))
+        tasks.append(
+            search_messages_for_account(
+                account,
+                search_text,
+                sender,
+                limit,
+                forward_to,
+                file_type,
+                stream_data=stream_messages,
+                stream_lock=stream_lock
+            )
+        )
 
     results = await asyncio.gather(*tasks)
 
@@ -358,8 +439,13 @@ async def search_messages(account_numbers, search_text=3, sender=3, limit=3, for
 
         for account in selected_accounts:
             forward_client = TelegramClient(account['session_file'], account['api_id'], account['api_hash'])
-            await forward_client.connect()
+            if not await connect_with_retry(forward_client, account['phone']):
+                continue
             forward_clients.append(forward_client)
+
+        if not forward_clients:
+            print(f"{mes['war']}No available sessions to forward messages.")
+            return
 
         forward_user = 3
         if forward_to.startswith('@'):
@@ -405,17 +491,16 @@ async def fetchDGC(account_numbers, entity_type):
         print(f"{messages['war']} No accounts found.")
         return
 
-    loop = asyncio.get_event_loop()
-    executor = ThreadPoolExecutor(max_workers=5)  
+    stream_entities = []
+    stream_lock = asyncio.Lock()
+    entity_file = FILES.get(entity_type, FILES['groups'])
+    save_data(entity_file, stream_entities)
 
     async def process_account(account):
-
-        new_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(new_loop)
-
         session_name = account['session_file'].split('.')[0]
         client = TelegramClient(session_name, account['api_id'], account['api_hash'])
-        await client.connect()
+        if not await connect_with_retry(client, account['phone']):
+            return
 
         print(f"{messages['wait']} Fetching {entity_type} for account: {account['phone']}")
 
@@ -432,18 +517,19 @@ async def fetchDGC(account_numbers, entity_type):
                         name = readname(dialog.name)
                         username = getattr(entity, 'username', 'Private')
 
+                        entity_data = None
                         if entity_type == "bots" and isinstance(dialog.entity, User) and getattr(dialog.entity, 'bot', False):
-                            entities.append({
+                            entity_data = {
                                 "name": name,
                                 "id": entity.id,
                                 "username": username,
                                 "type": "Bot",
                                 "created_at": datetime.datetime.now().isoformat(),
                                 "account_phone": account['phone']
-                            })
+                            }
                         elif entity_type == "dms" and dialog.is_user:
                             phone = getattr(entity, 'phone', "N/A")
-                            entities.append({
+                            entity_data = {
                                 "name": name,
                                 "id": entity.id,
                                 "username": username,
@@ -451,20 +537,23 @@ async def fetchDGC(account_numbers, entity_type):
                                 "type": "Direct Message",
                                 "created_at": datetime.datetime.now().isoformat(),
                                 "account_phone": account['phone']
-                            })
+                            }
                         elif entity_type != "bots" and entity_type != "dms":
-                            entities.append({
+                            entity_data = {
                                 "name": name,
                                 "id": entity.id,
                                 "username": username,
                                 "type": entity_type.capitalize(),
                                 "created_at": datetime.datetime.now().isoformat(),
                                 "account_phone": account['phone']
-                            })
+                            }
+
+                        if entity_data is not None:
+                            entities.append(entity_data)
+                            stream_entities.append(entity_data)
+                            await stream_save_list(entity_file, stream_entities, stream_lock)
                     except Exception as e:
                         print(f"{messages['error']}Error: {e}")
-
-            save_data(FILES.get(entity_type, FILES['groups']), entities)
 
         except Exception as e:
             print(f"{messages['error']}: {e}")
@@ -478,20 +567,17 @@ async def fetchDGC(account_numbers, entity_type):
         else:
             print(f"{messages['war']}No {entity_type} found.")
 
-    tasks = []
-    for account in selected_accounts:
-
-        task = loop.run_in_executor(executor, lambda: asyncio.run(process_account(account)))
-        tasks.append(task)
+    tasks = [process_account(account) for account in selected_accounts]
     await asyncio.gather(*tasks)
 
 
 
 
-async def capture_messages(account, target_username, forward_to, limit=3, file_type=3):
+async def capture_messages(account, target_username, forward_to, limit=3, file_type=3, stream_data=None, stream_lock=None):
     session_name = account['session_file'].split('.')[0]
     client = TelegramClient(session_name, account['api_id'], account['api_hash'])
-    await client.connect()
+    if not await connect_with_retry(client, account['phone']):
+        return
 
     print(f"{messages['wait']}Searching for messages of user {target_username} in account {account['phone']}")
     target = await get_chat_id_by_username(client, target_username)
@@ -516,7 +602,7 @@ async def capture_messages(account, target_username, forward_to, limit=3, file_t
                             cleaned_msg_text = readname(message.text or "")
                             sender_name = dialog.entity.title
 
-                            collected.append({
+                            captured_message = {
                                 "dialog_id": dialog.id,
                                 "message_id": message.id,
                                 "sender_id": message.sender_id,
@@ -524,7 +610,11 @@ async def capture_messages(account, target_username, forward_to, limit=3, file_t
                                 "message_type": get_message_type(message),
                                 "message": cleaned_msg_text[:150],  
                                 "date": message.date.isoformat()
-                            })
+                            }
+                            collected.append(captured_message)
+                            if stream_data is not None and stream_lock is not None:
+                                stream_data.append(captured_message)
+                                await stream_save_list(FILES["capture"], stream_data, stream_lock)
 
                         if limit and len(collected) >= limit:
                             break
@@ -534,8 +624,6 @@ async def capture_messages(account, target_username, forward_to, limit=3, file_t
         print(f"{messages['error']}Error in account {account['phone']}: {e}")
 
     await client.disconnect()
-
-    save_data(FILES["capture"], collected)
 
     if collected:
         headers = ["Sender ID", "Sender Name", "Message Type", "Message Text", "Date"]
@@ -549,7 +637,8 @@ async def capture_messages(account, target_username, forward_to, limit=3, file_t
         if forward_to:
             print(f"\n{messages['wait']}Forwarding messages...")
             forward_client = TelegramClient("forwarder", account['api_id'], account['api_hash'])
-            await forward_client.connect()
+            if not await connect_with_retry(forward_client, account['phone']):
+                return
 
             forward_user = 3
             if forward_to.startswith('@'):
@@ -571,8 +660,8 @@ async def capture_messages(account, target_username, forward_to, limit=3, file_t
     else:
         print(f"{messages['war']}No messages found.")
 
-async def capture_messages_for_account(account, target_username, forward_to, limit=3, file_type=3):
-    await capture_messages(account, target_username, forward_to, limit, file_type)
+async def capture_messages_for_account(account, target_username, forward_to, limit=3, file_type=3, stream_data=None, stream_lock=None):
+    await capture_messages(account, target_username, forward_to, limit, file_type, stream_data=stream_data, stream_lock=stream_lock)
 
 async def capture_main(account_numbers, target_username, forward_to, limit=3, file_type=3):
     accounts = load_accounts(FILES['accounts'])
@@ -583,13 +672,27 @@ async def capture_main(account_numbers, target_username, forward_to, limit=3, fi
         account_numbers = list(map(int, account_numbers.split(",")))
         selected_accounts = [acc for acc in accounts if acc['account_number'] in account_numbers]
 
+    stream_capture = []
+    stream_lock = asyncio.Lock()
+    save_data(FILES["capture"], stream_capture)
+
     tasks = []
     for account in selected_accounts:
-        tasks.append(capture_messages_for_account(account, target_username, forward_to, limit, file_type))
+        tasks.append(
+            capture_messages_for_account(
+                account,
+                target_username,
+                forward_to,
+                limit,
+                file_type,
+                stream_data=stream_capture,
+                stream_lock=stream_lock
+            )
+        )
 
     await asyncio.gather(*tasks)
 
-async def fetch_messages_from_channel(client, channel_link, limit="all"):
+async def fetch_messages_from_channel(client, channel_link, limit="all", on_message=None):
     try:
         channel = await client.get_entity(channel_link)
         print(f"{mes['wait']}Fetching messages from channel: {channel.title} ({channel.id})")
@@ -600,13 +703,17 @@ async def fetch_messages_from_channel(client, channel_link, limit="all"):
             if not msg_text:
                 continue
 
-            messages.append({
+            message_data = {
                 "dialog_id": channel.id,
                 "message_id": message.id,
                 "sender_id": message.sender_id,
                 "message": msg_text[:150], 
                 "date": message.date.isoformat()
-            })
+            }
+            messages.append(message_data)
+
+            if on_message is not None:
+                await on_message(message_data)
 
           
             if limit != "all" and len(messages) >= int(limit):
@@ -618,8 +725,10 @@ async def fetch_messages_from_channel(client, channel_link, limit="all"):
         return []
 
 
-async def forward_messages_to_channel(client, messages, forward_to, limit="all"):
+async def forward_messages_to_channel(client, messages, forward_to, limit="all", download_decision_provider=None):
     try:
+        if not limit:
+            limit = "all"
         forward_user = None
         if forward_to.startswith('@'):
             forward_user = await get_user_by_username(client, forward_to[1:])
@@ -668,8 +777,19 @@ async def forward_messages_to_channel(client, messages, forward_to, limit="all")
                     print(f"{mes['war']}Error forwarding message: {e}")
                   
                     if not download_messages: 
-                        user_input = input(f"{mes['ques']}Do you want to download and send the post manually? (y/n): ").lower()
-                        if user_input == 'y':
+                        if download_decision_provider is None:
+                            user_input = input(f"{mes['ques']}Do you want to download and send the post manually? (y/n): ").lower()
+                            wants_download = user_input == 'y'
+                        else:
+                            decision = await resolve_prompt_value(
+                                download_decision_provider,
+                                f"{mes['ques']}Do you want to download and send the post manually? (y/n): "
+                            )
+                            if isinstance(decision, bool):
+                                wants_download = decision
+                            else:
+                                wants_download = str(decision).strip().lower() in ("y", "yes", "s", "sim")
+                        if wants_download:
                             download_messages = True
                             print(f"{mes['suc']}sending post {msg['message_id']} manually...")
                     
@@ -691,8 +811,9 @@ async def forward_messages_to_channel(client, messages, forward_to, limit="all")
     except Exception as e:
         print(f"{mes['war']}Error forwarding messages: {e}")
 
-async def forward_from_channel(account_numbers, link, forward_to, limit="all", show_table=False):
+async def forward_from_channel(account_numbers, link, forward_to, limit="all", show_table=False, download_decision_provider=None):
     accounts = load_accounts(FILES['accounts'])
+    normalized_limit = limit if limit else "all"
 
     if account_numbers == "all":
         selected_accounts = accounts
@@ -701,18 +822,32 @@ async def forward_from_channel(account_numbers, link, forward_to, limit="all", s
         selected_accounts = [acc for acc in accounts if acc['account_number'] in account_numbers]
 
     all_forwarded_messages = []
+    stream_messages = []
+    stream_lock = asyncio.Lock()
+    save_data(FILES["messages"], stream_messages)
 
     tasks = []
     for account in selected_accounts:
         session_name = account['session_file'].split('.')[0]
         client = TelegramClient(session_name, account['api_id'], account['api_hash'])
-        await client.connect()
+        if not await connect_with_retry(client, account['phone']):
+            continue
 
-        messages = await fetch_messages_from_channel(client, link, limit)
+        async def on_found_message(message_data):
+            stream_messages.append(message_data)
+            await stream_save_list(FILES["messages"], stream_messages, stream_lock)
+
+        messages = await fetch_messages_from_channel(client, link, normalized_limit, on_message=on_found_message)
 
         if messages:
 
-            await forward_messages_to_channel(client, messages, forward_to, limit)
+            await forward_messages_to_channel(
+                client,
+                messages,
+                forward_to,
+                normalized_limit,
+                download_decision_provider=download_decision_provider
+            )
 
             for msg in messages:
                 all_forwarded_messages.append([msg["sender_id"], msg["message"], msg["date"]]) 
@@ -750,52 +885,50 @@ def save_links(links):
 
 async def link_finder(account_number):
     accounts = load_accounts(FILES['accounts'])
+    if account_number == "all":
+        selected_accounts = accounts
+    else:
+        account_numbers = list(map(int, account_number.split(","))) if isinstance(account_number, str) else [account_number]
+        selected_accounts = [acc for acc in accounts if acc['account_number'] in account_numbers]
 
-    account_numbers = list(map(int, account_number.split(","))) if isinstance(account_number, str) else [account_number]
-
-    account = [acc for acc in accounts if acc['account_number'] in account_numbers]
-
-    if not account:
+    if not selected_accounts:
         print(f"{messages['war']}Account not found.")
         return
+    links_found = {}
+    existing_links_in_memory = set()
 
-    account = account[0]  
-    session_name = account['session_file'].split('.')[0]
-    client = TelegramClient(session_name, account['api_id'], account['api_hash'])
-    await client.connect()
+    for account in selected_accounts:
+        session_name = account['session_file'].split('.')[0]
+        client = TelegramClient(session_name, account['api_id'], account['api_hash'])
+        if not await connect_with_retry(client, account['phone']):
+            continue
 
-    print(f"{messages['wait']}Searching links for account: {account['phone']}")
+        print(f"{messages['wait']}Searching links for account: {account['phone']}")
 
-    links_found = {} 
-    existing_links_in_memory = set()  
+        try:
+            async for dialog in client.iter_dialogs():
+                if dialog.is_channel or dialog.is_group or dialog.is_user or isinstance(dialog.entity, User):
+                    async for message in client.iter_messages(dialog.id):
+                        msg_text = message.text or ""
+                        if msg_text:
+                            links = extract_links(msg_text)
+                            for link in links:
+                                if link in existing_links_in_memory:
+                                    continue
 
-    try:
-        async for dialog in client.iter_dialogs():
-            if dialog.is_channel or dialog.is_group or dialog.is_user or isinstance(dialog.entity, User):
-                async for message in client.iter_messages(dialog.id):
-                    msg_text = message.text or ""
-                    if msg_text:
-                        links = extract_links(msg_text) 
-                        for link in links:
-                            if link in existing_links_in_memory:  
-                                continue
-                            
-                         
-                            domain = get_domain(link)
-                            
-                            if domain not in links_found:
-                                links_found[domain] = []
+                                domain = get_domain(link)
+                                if domain not in links_found:
+                                    links_found[domain] = []
 
-                            links_found[domain].append(link)
-                            existing_links_in_memory.add(link)
-                            save_links(links_found)
+                                links_found[domain].append(link)
+                                existing_links_in_memory.add(link)
+                                save_links(links_found)
+                                print(f"{messages['suc']}Found: {colors['yellow']}{link} ({colors['white']}Domain: {colors['red']}{domain}{colors['reset']})")
 
-                            print(f"{messages['suc']}Found: {colors['yellow']}{link} ({colors['white']}Domain: {colors['red']}{domain}{colors['reset']})")
-
-    except Exception as e:
-        print(f"{messages['error']}Error: {e}")
-
-    await client.disconnect()
+        except Exception as e:
+            print(f"{messages['error']}Error: {e}")
+        finally:
+            await client.disconnect()
 
     if links_found:
         print(f"\n{messages['suc']}Links Found and Saved:")
@@ -867,7 +1000,7 @@ if __name__ == "__main__":
         exit()
 
     if not args.acc:
-        print(f"""
+        print(rf"""
 {colors['yellow']}
  _____    _      _   _             _   
 |_   _|__| | ___| | | |_   _ _ __ | |_ 
@@ -878,8 +1011,11 @@ if __name__ == "__main__":
 {messages['error']}Invalid arguments. Use --help for usage information.""")
         exit()
 
+    search_with_empty_text_and_filetype = args.search_text == "" and bool(args.file_type)
+    search_with_non_empty_text = bool(args.search_text)
+
     dispatch = [
-        (args.search_text, lambda: search_messages(args.acc, args.search_text, args.sender, args.limit, args.forward, args.file_type)),
+        (search_with_non_empty_text or search_with_empty_text_and_filetype, lambda: search_messages(args.acc, args.search_text, args.sender, args.limit, args.forward, args.file_type)),
         (args.link and args.forward, lambda: forward_from_channel(args.acc, args.link, args.forward, args.limit, args.table)),
         (args.groups, lambda: fetchDGC(args.acc, "groups")),
         (args.linkfinder, lambda: link_finder(args.acc)),
@@ -893,7 +1029,10 @@ if __name__ == "__main__":
         if condition:
             clear()
             print(w)
-            asyncio.run(func())
+            try:
+                asyncio.run(func())
+            except KeyboardInterrupt:
+                print(f"{messages['war']}Interrupted by user. Partial results remain saved.")
             break
     else:
         print (f"{messages['error']}Invalid arguments. Use --help for usage information.")

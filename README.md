@@ -22,6 +22,7 @@
 - 💾 **JSON Export** - Save all results in structured JSON format
 - 🎨 **Beautiful Tables** - Display results in formatted tables using tabulate
 - ⚡ **Async Operations** - Fast concurrent processing with asyncio
+- 🖥️ **Desktop GUI** - Run all core actions from a tabbed graphical interface
 
 ## 🖼️ Screenshot
 
@@ -47,6 +48,9 @@ pip install telethon tabulate colorama
 
 # Run the tool
 python TeleHunt.py
+
+# Run the GUI
+python TeleHuntGUI.py
 ```
 
 ## 📖 Documentation
